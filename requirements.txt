@@ -1,0 +1,21 @@
+# MoE Route Optimizer Dependencies
+# Install with: pip install -r requirements.txt
+
+# Core deep learning framework
+torch>=2.0.0
+
+# Numerical computing
+numpy>=1.24.0
+
+# Hugging Face ecosystem (required by hf_accelerate_adapter)
+transformers>=4.40.0
+
+# Distributed training support (optional, used by hf_accelerate_adapter)
+accelerate>=0.30.0
+
+# Inference backend (install at most one, based on your deployment)
+# Option 1: SGLang backend (used by sglang_adapter.py and scripts/)
+# sglang>=0.4.0
+
+# Option 2: vLLM backend (used by vllm_adapter.py)
+# vllm>=0.5.0

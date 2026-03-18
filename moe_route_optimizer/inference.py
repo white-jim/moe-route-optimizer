@@ -10,8 +10,10 @@ import argparse
 import torch
 from typing import Optional
 
-# 添加项目路径
-sys.path.insert(0, '/mnt/data/lwy/vLLM-wrok/moe_route_optimizer')
+# 添加项目路径（使用相对路径，兼容任何工作环境）
+_PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 from config import (
     Config,

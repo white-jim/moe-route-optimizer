@@ -4,7 +4,7 @@ SGLang 推理适配器
 
 SGLang特点:
 - 支持真正的专家并行(EP)，使用all-to-all通信
-- 支持多种all-to-all后端: deepep, flashinfer, mooncake, mori
+- 支持enable_ep_moe / enable_deepep_moe两种EP模式
 - 高性能的MoE推理
 - 框架内部自行管理多rank和各类并行，外部只需要输入数据、获取输出
 
@@ -12,6 +12,7 @@ SGLang特点:
     python your_script.py --model-path /path/to/model
 """
 
+import dataclasses
 import os
 import sys
 import time
@@ -19,10 +20,6 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-
-workspace_root = "/mnt/data/lwy/vLLM-wrok/moe_route_optimizer"
-if workspace_root not in sys.path:
-    sys.path.insert(0, workspace_root)
 
 from interfaces.framework_interface import InferenceFrameworkInterface
 from config import get_logger
@@ -37,13 +34,10 @@ class SGLangAdapter(InferenceFrameworkInterface):
     支持专家并行(EP)的MoE模型分布式推理
     
     专家并行配置:
-    - ep_size: 专家并行大小，通常等于GPU数量
-    - moe_a2a_backend: all-to-all通信后端
-        - 'none': 使用all-reduce/all-gather
-        - 'deepep': DeepSeek的高性能EP库
-        - 'flashinfer': FlashInfer实现
-        - 'mooncake': 支持弹性推理
-        - 'mori': AMD ROCm优化版本
+    - tp_size: 张量并行大小，同时决定EP大小（enable_ep_moe时ep_size=tp_size）
+    - enable_ep_moe: 启用标准EP MoE模式（ep_size自动设为tp_size）
+    - enable_deepep_moe: 启用DeepEP MoE模式（ep_size自动设为tp_size）
+    - ep_size: 专家并行大小（通常通过enable_ep_moe/enable_deepep_moe自动设置）
     """
     
     def __init__(self):
@@ -91,31 +85,37 @@ class SGLangAdapter(InferenceFrameworkInterface):
             model_path: 模型路径
             **kwargs: 支持的参数:
                 - tensor_parallel_size (int): 张量并行大小
-                - expert_parallel_size (int): 专家并行大小
                 - data_parallel_size (int): 数据并行大小
-                - moe_a2a_backend (str): all-to-all后端
-                - max_model_len (int): 最大模型长度
+                - enable_ep_moe (bool): 启用EP MoE模式（ep_size自动设为tp_size）
+                - enable_deepep_moe (bool): 启用DeepEP MoE模式
+                - context_length (int): 最大上下文长度
                 - trust_remote_code (bool): 是否信任远程代码
-                - max_tokens (int): 最大生成token数
+                - max_tokens (int): 默认最大生成token数
+                - random_seed (int): 随机种子
         
         Returns:
-            加载的模型
+            加载的模型（SGLang Engine，框架内部自行管理实际模型参数）
         """
         self.logger.info(f"Loading SGLang model from: {model_path}")
         
         tp_size = kwargs.get('tensor_parallel_size', 1)
-        ep_size = kwargs.get('expert_parallel_size', 1)
         dp_size = kwargs.get('data_parallel_size', 1)
-        moe_a2a_backend = kwargs.get('moe_a2a_backend', 'none')
-        max_model_len = kwargs.get('max_model_len', 2048)
+        enable_ep_moe = kwargs.get('enable_ep_moe', False)
+        enable_deepep_moe = kwargs.get('enable_deepep_moe', False)
+        context_length = kwargs.get('context_length', None)
         trust_remote_code = kwargs.get('trust_remote_code', True)
         max_tokens = kwargs.get('max_tokens', 128)
+        random_seed = kwargs.get('random_seed', 42)
         
+        # ep_size 由 enable_ep_moe/enable_deepep_moe 在 ServerArgs.__post_init__ 中自动设为 tp_size
+        # 这里记录的 ep_size 仅供外部查询使用
+        ep_size = tp_size if (enable_ep_moe or enable_deepep_moe) else kwargs.get('ep_size', 1)
         self._init_distributed(tp_size=tp_size, ep_size=ep_size, dp_size=dp_size)
         
         try:
+            import sglang as sgl
+            from sglang.srt.server_args import ServerArgs
             from transformers import AutoTokenizer, AutoConfig
-            from sglang import Runtime, SamplingParams
             
             config = AutoConfig.from_pretrained(
                 model_path,
@@ -131,28 +131,34 @@ class SGLangAdapter(InferenceFrameworkInterface):
             if self.tokenizer.pad_token is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
             
-            self.sampling_params = SamplingParams(
-                temperature=kwargs.get('temperature', 0.0),
-                top_p=kwargs.get('top_p', 1.0),
-                max_new_tokens=max_tokens,
-            )
+            # sampling_params 使用 dict 格式（新版 SGLang Engine.generate 接受 dict）
+            self.sampling_params = {
+                "temperature": kwargs.get('temperature', 0.0),
+                "top_p": kwargs.get('top_p', 1.0),
+                "max_new_tokens": max_tokens,
+            }
             
             self.logger.info(
                 f"SGLang config: tp={tp_size}, ep={ep_size}, dp={dp_size}, "
-                f"moe_a2a_backend={moe_a2a_backend}, hidden_size={self._hidden_size}"
+                f"enable_ep_moe={enable_ep_moe}, enable_deepep_moe={enable_deepep_moe}, "
+                f"hidden_size={self._hidden_size}"
             )
             
-            self._sglang_runtime = Runtime(
+            server_args = ServerArgs(
                 model_path=model_path,
                 tp_size=tp_size,
-                ep_size=ep_size,
                 dp_size=dp_size,
-                moe_a2a_backend=moe_a2a_backend,
+                enable_ep_moe=enable_ep_moe,
+                enable_deepep_moe=enable_deepep_moe,
                 trust_remote_code=trust_remote_code,
-                max_context_len=max_model_len,
+                context_length=context_length,
+                random_seed=random_seed,
             )
             
-            self.model = getattr(self._sglang_runtime, 'model', None)
+            self._sglang_engine = sgl.Engine(**dataclasses.asdict(server_args))
+            
+            # SGLang Engine 不直接暴露 nn.Module，model 属性设为 engine 本身供外部感知
+            self.model = self._sglang_engine
             
             self._find_moe_layers()
             
@@ -165,46 +171,14 @@ class SGLangAdapter(InferenceFrameworkInterface):
         return self.model
     
     def _find_moe_layers(self):
-        """查找模型中的MoE层"""
+        """查找模型中的MoE层（SGLang Engine 不直接暴露 nn.Module，跳过层查找）"""
         self._moe_layers = []
         self._first_moe_gate = None
         self._first_moe_block = None
         
-        if self.model is None:
-            return
-        
-        moe_keywords = [
-            'moe', 'MoE', 'MOE',
-            'mixtral', 'Mixtral',
-            'sparsemoe', 'SparseMoe',
-            'expert', 'Expert',
-        ]
-        
-        for name, module in self.model.named_modules():
-            class_name = module.__class__.__name__
-            name_lower = name.lower()
-            
-            is_moe_block = any(kw.lower() in class_name.lower() for kw in moe_keywords)
-            has_gate = hasattr(module, 'gate')
-            has_experts = hasattr(module, 'experts')
-            is_complete_moe_block = has_gate and has_experts
-            
-            if is_moe_block and is_complete_moe_block:
-                self._moe_layers.append(module)
-                
-                if self._first_moe_block is None:
-                    self._first_moe_block = module
-                    self.logger.info(f"Found first MoE block: {name} ({class_name})")
-                
-                if self._first_moe_gate is None and has_gate:
-                    self._first_moe_gate = module.gate
-                continue
-            
-            if is_moe_block or any(kw in name_lower for kw in ['moe', 'expert']):
-                if module not in self._moe_layers:
-                    self._moe_layers.append(module)
-        
-        self.logger.info(f"Found {len(self._moe_layers)} MoE layers")
+        # 新版 SGLang 使用 Engine 接口，不直接暴露 nn.Module 给外部
+        # MoE 层由框架内部管理，无法通过 named_modules() 遍历
+        self.logger.info("SGLang Engine does not expose nn.Module directly; MoE layer search skipped.")
     
     def run_inference(self, inputs: Any, sampling_params: Any = None) -> Any:
         """
@@ -215,12 +189,13 @@ class SGLangAdapter(InferenceFrameworkInterface):
                 - str: 单个文本
                 - List[str]: 多个文本
                 - Dict: 包含'prompts'键的字典
-            sampling_params: 可选的采样参数
+            sampling_params: 可选的采样参数，支持 dict 格式
+                例如: {"temperature": 0.0, "top_p": 1.0, "max_new_tokens": 128}
         
         Returns:
             推理输出列表（与vLLM格式兼容）
         """
-        if not hasattr(self, '_sglang_runtime'):
+        if not hasattr(self, '_sglang_engine'):
             self.logger.error("Model not loaded. Call load_model() first.")
             return None
         
@@ -239,22 +214,21 @@ class SGLangAdapter(InferenceFrameworkInterface):
             self._last_output = None
             return []
         
+        # 新版 SGLang Engine.generate 接受 dict 格式的 sampling_params
         params = sampling_params if sampling_params is not None else self.sampling_params
         
         start_time = time.time()
         
         try:
-            outputs = self._sglang_runtime.generate(
-                prompts,
-                params,
-            )
+            # engine.generate 返回 list of dict，每个 dict 包含 "text" 等字段
+            raw_outputs = self._sglang_engine.generate(prompts, params)
         except Exception as e:
             self.logger.error(f"Inference failed: {e}")
             return None
         
         self._last_comm_delay = time.time() - start_time
         
-        self._last_outputs = self._convert_outputs(outputs, prompts)
+        self._last_outputs = self._convert_outputs(raw_outputs, prompts)
         self._last_output = self._last_outputs[0] if self._last_outputs else None
         
         self.logger.debug(
@@ -267,7 +241,11 @@ class SGLangAdapter(InferenceFrameworkInterface):
         """
         将SGLang输出转换为与vLLM兼容的格式
         
-        vLLM输出格式:
+        新版 SGLang Engine.generate 返回 list of dict，每个 dict 包含:
+            - "text": str  生成的文本
+            - "meta_info": dict  元信息（包含 token 数量等）
+        
+        转换后格式（vLLM兼容）:
         - RequestOutput对象，包含:
             - prompt: str
             - outputs: List[CompletionOutput]
@@ -297,6 +275,7 @@ class SGLangAdapter(InferenceFrameworkInterface):
                 prompt = prompts[i] if i < len(prompts) else ""
                 
                 if isinstance(output, dict):
+                    # 新版 SGLang Engine 返回 dict，包含 "text" 字段
                     text = output.get('text', '')
                     token_ids = output.get('token_ids', [])
                 elif isinstance(output, str):
@@ -461,9 +440,9 @@ def create_sglang_adapter() -> SGLangAdapter:
 def create_sglang_adapter_with_model(
     model_path: str,
     tensor_parallel_size: int = 1,
-    expert_parallel_size: int = 1,
     data_parallel_size: int = 1,
-    moe_a2a_backend: str = "none",
+    enable_ep_moe: bool = False,
+    enable_deepep_moe: bool = False,
     **kwargs
 ) -> SGLangAdapter:
     """
@@ -471,11 +450,11 @@ def create_sglang_adapter_with_model(
     
     Args:
         model_path: 模型路径
-        tensor_parallel_size: 张量并行大小
-        expert_parallel_size: 专家并行大小
+        tensor_parallel_size: 张量并行大小（同时决定 EP 大小）
         data_parallel_size: 数据并行大小
-        moe_a2a_backend: all-to-all后端
-        **kwargs: 其他参数
+        enable_ep_moe: 启用标准EP MoE模式（ep_size自动设为tp_size）
+        enable_deepep_moe: 启用DeepEP MoE模式（ep_size自动设为tp_size）
+        **kwargs: 其他参数（context_length, random_seed, max_tokens, temperature, etc.）
     
     Returns:
         加载好模型的适配器
@@ -484,9 +463,9 @@ def create_sglang_adapter_with_model(
     adapter.load_model(
         model_path,
         tensor_parallel_size=tensor_parallel_size,
-        expert_parallel_size=expert_parallel_size,
         data_parallel_size=data_parallel_size,
-        moe_a2a_backend=moe_a2a_backend,
+        enable_ep_moe=enable_ep_moe,
+        enable_deepep_moe=enable_deepep_moe,
         **kwargs
     )
     return adapter

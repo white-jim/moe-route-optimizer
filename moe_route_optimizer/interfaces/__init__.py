@@ -25,10 +25,7 @@ from .evaluator_impl import (
     BoolQEvaluator,
     HellaSwagEvaluator,
     DummyEvaluator,
-    LMEvalEvaluator,
-    PrecomputedLM,
     create_evaluator,
-    create_lm_eval_evaluator,
 )
 
 __all__ = [
@@ -50,8 +47,5 @@ __all__ = [
     'BoolQEvaluator',
     'HellaSwagEvaluator',
     'DummyEvaluator',
-    'LMEvalEvaluator',
-    'PrecomputedLM',
     'create_evaluator',
-    'create_lm_eval_evaluator',
 ]

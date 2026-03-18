@@ -17,8 +17,10 @@ import random
 import numpy as np
 from typing import Optional, List, Tuple
 
-# 添加项目路径
-sys.path.insert(0, '/mnt/data/lwy/vLLM-wrok/moe_route_optimizer')
+# 添加项目路径（使用相对路径，兼容任何工作环境）
+_PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 
 # from vllm.distributed.device_communicators.all2all import _total_all2all_time

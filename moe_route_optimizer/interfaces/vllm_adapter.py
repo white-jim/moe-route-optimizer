@@ -11,8 +11,9 @@ from typing import Any, Dict, List, Optional, Iterator, Tuple, Union
 import time
 
 import sys
-# 确保使用与 vllm/all2all.py 相同的导入路径
-workspace_root = "/mnt/data/lwy/vLLM-wrok/moe_route_optimizer"
+# 确保使用与 vllm/all2all.py 相同的导入路径（使用相对路径，兼容任何工作环境）
+import os as _os
+workspace_root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
 if workspace_root not in sys.path:
     sys.path.insert(0, workspace_root)
 

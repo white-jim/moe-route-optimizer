@@ -78,14 +78,14 @@ class PolicyGradientTrainer:
                            done: bool = False,
                            log_prob: torch.Tensor = None,
                            selected_indices: torch.Tensor = None,
-                           perturb_types: torch.Tensor = None) -> Dict[str, torch.Tensor]:
+                           perturb_dim_indices: torch.Tensor = None) -> Dict[str, torch.Tensor]:
         """
         收集一步经验（batch级别）
         
         数据形状约定（与 perturbation_generator 一致）：
         - hidden_states: (batch, seq_len, hidden) - 3D
         - selected_indices: (batch, num_select) - 2D
-        - perturb_types: (batch, num_select) - 2D
+        - perturb_dim_indices: (batch, num_select, num_perturb_dims) - 3D
         - log_prob: (batch,) - 1D
         
         直接存储原始形状，不做维度调整。
@@ -94,7 +94,7 @@ class PolicyGradientTrainer:
         self.rollout_buffer.add(
             hidden_states=hidden_states,
             selected_indices=selected_indices,
-            perturb_types=perturb_types,
+            perturb_dim_indices=perturb_dim_indices,
             log_prob=log_prob,
             reward=reward,
             done=done,
@@ -102,7 +102,7 @@ class PolicyGradientTrainer:
         return {
             'log_prob': log_prob,
             'selected_indices': selected_indices,
-            'perturb_types': perturb_types,
+            'perturb_dim_indices': perturb_dim_indices,
         }
     
     def _sync_gradients(self):
@@ -145,7 +145,7 @@ class PolicyGradientTrainer:
         执行策略梯度更新（简化版REINFORCE）
         
         关键：使用 get_log_prob 重新计算 log_prob，保留梯度用于反向传播
-        buffer 中的 selected_indices 和 perturb_types 记录了采样时的动作
+        buffer 中的 selected_indices 和 perturb_dim_indices 记录了采样时的动作
         """
         global print_num
         if len(self.rollout_buffer) == 0:
@@ -163,14 +163,14 @@ class PolicyGradientTrainer:
         # 获取数据（形状已统一，无需维度调整）
         # hidden_states: (batch, seq_len, hidden)
         # selected_indices: (batch, num_select)
-        # perturb_types: (batch, num_select)
+        # perturb_dim_indices: (batch, num_select, num_perturb_dims)
         hidden_states = batch['hidden_states']
         selected_indices = batch['selected_indices']
-        perturb_types = batch['perturb_types']
+        perturb_dim_indices = batch['perturb_dim_indices']
         
         # 重新计算 log_prob（有梯度！）
         # 这样才能建立从 actor 参数到 loss 的计算图
-        log_probs = self.actor.get_log_prob(hidden_states, selected_indices, perturb_types)
+        log_probs = self.actor.get_log_prob(hidden_states, selected_indices, perturb_dim_indices)
         # log_probs = batch['log_probs']
         
         # 使用移动平均baseline计算advantage
@@ -394,7 +394,7 @@ class PolicyGradientTrainer:
         # 获取数据
         hidden_states = batch['hidden_states']         # (batch, seq_len, hidden)
         selected_indices = batch['selected_indices']    # (batch, num_select)
-        perturb_types = batch['perturb_types']          # (batch, num_select)
+        perturb_dim_indices = batch['perturb_dim_indices']          # (batch, num_select, num_perturb_dims)
         old_log_probs = batch['log_probs']              # (batch,)
         rewards = batch['rewards'].float()              # (num_experiences,)
         
@@ -431,7 +431,7 @@ class PolicyGradientTrainer:
         for epoch in range(self.config.ppo_epochs):
             # ========== Actor更新 ==========
             # 用当前策略重新计算log_prob（带梯度）
-            new_log_probs = self.actor.get_log_prob(hidden_states, selected_indices, perturb_types)
+            new_log_probs = self.actor.get_log_prob(hidden_states, selected_indices, perturb_dim_indices)
             
             # Importance sampling ratio
             log_ratio = new_log_probs - old_log_probs

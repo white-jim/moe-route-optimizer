@@ -233,7 +233,7 @@ class ExpertParallelWrapper(nn.Module):
 
         comm_mid.record()
 
-        # 本地专家计算
+        # 本地专家计算（不计入通信时延）
         recv_output = torch.zeros_like(recv_hidden)
         if total_recv > 0:
             for local_idx in range(self.experts_per_gpu):
@@ -243,7 +243,10 @@ class ExpertParallelWrapper(nn.Module):
 
         recv_output_w = recv_output * recv_weights.unsqueeze(-1)
 
-        # All-to-all combine
+        # All-to-all combine（单独计时，不含本地专家计算）
+        comm_combine_start = torch.cuda.Event(enable_timing=True)
+        comm_combine_start.record()
+
         send_output = torch.zeros(total_send, hidden_size, device=device, dtype=dtype)
         send_back_tids = torch.zeros(total_send, device=device, dtype=torch.long)
 
@@ -277,7 +280,7 @@ class ExpertParallelWrapper(nn.Module):
         comm_end.record()
         torch.cuda.synchronize()
         dispatch_ms = comm_start.elapsed_time(comm_mid)
-        combine_ms = comm_mid.elapsed_time(comm_end)
+        combine_ms = comm_combine_start.elapsed_time(comm_end)
         self._total_comm_delay += (dispatch_ms + combine_ms) / 1000.0
 
         # 汇聚结果
@@ -304,6 +307,163 @@ class ExpertParallelWrapper(nn.Module):
             # )
 
         return output_flat.view(batch_size, seq_len, hidden_size)
+
+
+class _RemovableHookHandle:
+    """可移除的hook句柄，调用remove()时通知所有worker移除对应hook"""
+
+    def __init__(self, cmd_queues, result_queues, hook_id, target_name):
+        self._cmd_queues = cmd_queues
+        self._result_queues = result_queues
+        self._hook_id = hook_id
+        self._target_name = target_name
+
+    def remove(self):
+        for q in self._cmd_queues:
+            q.put({
+                'type': 'remove_hook',
+                'target': self._target_name,
+                'hook_id': self._hook_id,
+            })
+        for rq in self._result_queues:
+            rq.get(timeout=30)
+
+
+class _WorkerModuleProxy(nn.Module):
+    """
+    主进程中的模块代理，将hook注册转发到worker进程的实际模块上。
+
+    当用户调用 proxy.register_forward_pre_hook(fn) 时，hook会被发送到
+    所有worker进程，注册在实际参与推理的模块上，因此每次推理时hook都会触发。
+
+    注意：hook函数必须是可pickle的（模块级函数或可序列化的类实例）。
+    """
+
+    def __init__(self, cmd_queues, result_queues, target_name, adapter=None,
+                 gate_state_dict=None, gate_in_features=None, gate_out_features=None,
+                 gate_has_bias=False, num_experts=None, top_k=None, norm_topk_prob=None):
+        super().__init__()
+        self._cmd_queues = cmd_queues
+        self._result_queues = result_queues
+        self._target_name = target_name  # 'first_moe_block' or 'first_moe_gate'
+        self._adapter = adapter  # back-reference to HFAccelerateAdapter
+        self._hook_counter = 0
+
+        # 元数据（用于参数检查）
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.norm_topk_prob = norm_topk_prob
+
+        # 重建gate权重副本（用于参数检查，如 proxy.gate.weight）
+        if gate_state_dict is not None and gate_in_features is not None:
+            self.gate = nn.Linear(gate_in_features, gate_out_features, bias=gate_has_bias)
+            self.gate.load_state_dict(gate_state_dict)
+            self.gate.eval()
+
+    def _send_cmd_and_wait(self, cmd):
+        """向所有worker发送命令并等待确认"""
+        for q in self._cmd_queues:
+            q.put(cmd)
+        for rq in self._result_queues:
+            result = rq.get(timeout=30)
+            if result.get('status') != 'ok':
+                raise RuntimeError(f"Worker command failed: {result}")
+
+    def register_forward_pre_hook(self, hook, *args, **kwargs):
+        """
+        在worker进程的实际模块上注册forward pre-hook。
+        hook会在每次推理时、该模块forward之前被调用。
+        """
+        hook_id = f"{self._target_name}_pre_{self._hook_counter}"
+        self._hook_counter += 1
+        self._send_cmd_and_wait({
+            'type': 'register_hook',
+            'target': self._target_name,
+            'hook_type': 'forward_pre',
+            'hook_fn': hook,
+            'hook_id': hook_id,
+        })
+        return _RemovableHookHandle(
+            self._cmd_queues, self._result_queues, hook_id, self._target_name
+        )
+
+    def register_forward_hook(self, hook, *args, **kwargs):
+        """
+        在worker进程的实际模块上注册forward hook。
+        hook会在每次推理时、该模块forward之后被调用。
+        """
+        hook_id = f"{self._target_name}_fwd_{self._hook_counter}"
+        self._hook_counter += 1
+        self._send_cmd_and_wait({
+            'type': 'register_hook',
+            'target': self._target_name,
+            'hook_type': 'forward',
+            'hook_fn': hook,
+            'hook_id': hook_id,
+        })
+        return _RemovableHookHandle(
+            self._cmd_queues, self._result_queues, hook_id, self._target_name
+        )
+
+    def _register_perturbation_generator(self, generator):
+        """
+        将扰动生成器发送到所有worker进程，在目标模块上注册扰动hook。
+        generator必须是nn.Module（可pickle）。
+        """
+        import copy
+        gen_cpu = copy.deepcopy(generator).cpu()
+        for q in self._cmd_queues:
+            q.put({
+                'type': 'register_perturbation_hook',
+                'target': self._target_name,
+                'generator': gen_cpu,
+            })
+        for rq in self._result_queues:
+            result = rq.get(timeout=120)
+            if result.get('status') != 'ok':
+                raise RuntimeError(f"Failed to register perturbation hook: {result}")
+
+    def _sync_perturbation_weights(self, state_dict):
+        """将更新后的generator权重同步到所有worker"""
+        cpu_sd = {k: v.cpu().clone() for k, v in state_dict.items()}
+        for q in self._cmd_queues:
+            q.put({'type': 'sync_perturbation_weights', 'state_dict': cpu_sd})
+        for rq in self._result_queues:
+            rq.get(timeout=30)
+
+    def _set_hook_enabled(self, enabled):
+        """设置worker中hook的启用/禁用状态"""
+        for q in self._cmd_queues:
+            q.put({'type': 'set_hook_enabled', 'enabled': enabled})
+        for rq in self._result_queues:
+            rq.get(timeout=30)
+
+    def _set_hook_training(self, training):
+        """设置worker中hook的训练/推理模式"""
+        for q in self._cmd_queues:
+            q.put({'type': 'set_hook_training', 'training': training})
+        for rq in self._result_queues:
+            rq.get(timeout=30)
+
+    def _clear_hook_buffer(self):
+        """清空worker中hook收集的状态"""
+        for q in self._cmd_queues:
+            q.put({'type': 'clear_hook_buffer'})
+        for rq in self._result_queues:
+            rq.get(timeout=30)
+
+    def _get_collected_states(self):
+        """获取最近一次推理中hook收集的状态（来自adapter的缓存）"""
+        if self._adapter is not None:
+            return self._adapter._last_hook_states
+        return []
+
+    def _remove_perturbation_hook(self):
+        """通知所有worker移除扰动hook"""
+        for q in self._cmd_queues:
+            q.put({'type': 'remove_perturbation_hook'})
+        for rq in self._result_queues:
+            rq.get(timeout=30)
 
 
 # ========== Worker辅助函数 ==========
@@ -383,6 +543,14 @@ def _ep_worker_fn(rank, world_size, master_port, cmd_queue, result_queue):
     logger.info(f"[Worker {rank}] Started on {device}")
 
     model, tokenizer, ep_wrappers = None, None, []
+    hook_handles = {}  # hook_id -> RemovableHandle
+    hook_state = {
+        'generator': None,
+        'enabled': True,
+        'training': True,
+        'collected_states': [],
+        'hook_handle': None,
+    }
     hidden_size = 0
 
     try:
@@ -425,8 +593,27 @@ def _ep_worker_fn(rank, world_size, master_port, cmd_queue, result_queue):
                 )
 
                 # ====== Step 2: 在CPU上应用EP，只保留本rank的专家 ======
-                moe_layers, moe_names, _, _ = _find_moe_layers_in_model(model, logger)
+                moe_layers, moe_names, first_block, first_gate = _find_moe_layers_in_model(model, logger)
                 experts_per_gpu = num_experts // world_size
+
+                # 捕获gate信息（仅rank 0，通过queue传回主进程用于参数检查）
+                gate_info = None
+                if rank == 0 and first_gate is not None:
+                    gate_info = {
+                        'state_dict': {k: v.cpu().clone() for k, v in first_gate.state_dict().items()},
+                        'in_features': first_gate.in_features,
+                        'out_features': first_gate.out_features,
+                        'has_bias': first_gate.bias is not None,
+                    }
+                block_info = None
+                if rank == 0 and first_block is not None:
+                    block_info = {
+                        'num_experts': getattr(first_block, 'num_experts', num_experts),
+                        'top_k': getattr(first_block, 'top_k',
+                                         getattr(first_block, 'num_experts_per_tok', 2)),
+                        'norm_topk_prob': getattr(first_block, 'norm_topk_prob', True),
+                    }
+                del first_block, first_gate
 
                 if world_size > 1 and moe_layers:
                     logger.info(
@@ -463,7 +650,135 @@ def _ep_worker_fn(rank, world_size, master_port, cmd_queue, result_queue):
                     'status': 'ok',
                     'hidden_size': hidden_size,
                     'num_moe_layers': len(ep_wrappers),
+                    'gate_info': gate_info,
+                    'block_info': block_info,
                 })
+
+            elif cmd['type'] == 'register_hook':
+                target_name = cmd['target']
+                hook_type = cmd['hook_type']
+                hook_fn = cmd['hook_fn']
+                hook_id = cmd['hook_id']
+
+                # 确定目标模块
+                target_module = None
+                if target_name == 'first_moe_block' and ep_wrappers:
+                    target_module = ep_wrappers[0]
+                elif target_name == 'first_moe_gate' and ep_wrappers:
+                    target_module = ep_wrappers[0].gate
+
+                if target_module is not None:
+                    if hook_type == 'forward_pre':
+                        handle = target_module.register_forward_pre_hook(hook_fn)
+                    else:
+                        handle = target_module.register_forward_hook(hook_fn)
+                    hook_handles[hook_id] = handle
+                    logger.info(f"[Worker {rank}] Registered {hook_type} hook '{hook_id}' on {target_name}")
+                    result_queue.put({'status': 'ok'})
+                else:
+                    logger.warning(f"[Worker {rank}] Hook target '{target_name}' not found")
+                    result_queue.put({'status': 'ok'})  # 不阻塞主进程
+
+            elif cmd['type'] == 'remove_hook':
+                hook_id = cmd['hook_id']
+                if hook_id in hook_handles:
+                    hook_handles[hook_id].remove()
+                    del hook_handles[hook_id]
+                    logger.info(f"[Worker {rank}] Removed hook '{hook_id}'")
+                result_queue.put({'status': 'ok'})
+
+            elif cmd['type'] == 'register_perturbation_hook':
+                target_name = cmd['target']
+                gen = cmd['generator'].to(device)
+                hook_state['generator'] = gen
+                hook_state['generator'].eval()
+
+                target_module = None
+                if target_name == 'first_moe_block' and ep_wrappers:
+                    target_module = ep_wrappers[0]
+                elif target_name == 'first_moe_gate' and ep_wrappers:
+                    target_module = ep_wrappers[0].gate
+
+                if target_module is not None:
+                    if hook_state['hook_handle'] is not None:
+                        hook_state['hook_handle'].remove()
+
+                    def _perturbation_hook(module, args):
+                        if not hook_state['enabled']:
+                            return args
+                        if len(args) == 0:
+                            return args
+                        hidden_states = args[0]
+                        if not isinstance(hidden_states, torch.Tensor):
+                            return args
+                        if hidden_states.dim() >= 2 and hidden_states.shape[1] == 1:
+                            return args
+                        orig_shape = hidden_states.shape
+                        orig_dim = hidden_states.dim()
+                        if orig_dim == 2:
+                            hidden_states_3d = hidden_states.unsqueeze(0)
+                        elif orig_dim == 3:
+                            hidden_states_3d = hidden_states
+                        else:
+                            return args
+                        gen_local = hook_state['generator']
+                        with torch.no_grad():
+                            result = gen_local(
+                                hidden_states_3d,
+                                deterministic=not hook_state['training'],
+                            )
+                        perturbed_hidden_3d = result['perturbed_hidden_states']
+                        if orig_dim == 2:
+                            perturbed_hidden = perturbed_hidden_3d.squeeze(0)
+                        else:
+                            perturbed_hidden = perturbed_hidden_3d
+                        if perturbed_hidden.shape != orig_shape:
+                            perturbed_hidden = perturbed_hidden.view(orig_shape)
+                        if hook_state['training']:
+                            hook_state['collected_states'].append({
+                                'hidden_states': hidden_states_3d.detach().cpu().clone(),
+                                'selected_indices': result['selected_indices'].detach().cpu().clone(),
+                                'perturb_dim_indices': result['perturb_dim_indices'].detach().cpu().clone(),
+                                'log_prob': result['log_prob'].detach().cpu().clone(),
+                                'perturbation': perturbed_hidden_3d.detach().cpu().clone(),
+                            })
+                        return (perturbed_hidden,) + args[1:]
+
+                    handle = target_module.register_forward_pre_hook(_perturbation_hook)
+                    hook_state['hook_handle'] = handle
+                    logger.info(f"[Worker {rank}] Registered perturbation hook on {target_name}")
+                result_queue.put({'status': 'ok'})
+
+            elif cmd['type'] == 'sync_perturbation_weights':
+                if hook_state['generator'] is not None:
+                    sd = {k: v.to(device) for k, v in cmd['state_dict'].items()}
+                    hook_state['generator'].load_state_dict(sd)
+                result_queue.put({'status': 'ok'})
+
+            elif cmd['type'] == 'set_hook_enabled':
+                hook_state['enabled'] = cmd['enabled']
+                result_queue.put({'status': 'ok'})
+
+            elif cmd['type'] == 'set_hook_training':
+                hook_state['training'] = cmd['training']
+                if hook_state['generator'] is not None:
+                    if cmd['training']:
+                        hook_state['generator'].train()
+                    else:
+                        hook_state['generator'].eval()
+                result_queue.put({'status': 'ok'})
+
+            elif cmd['type'] == 'clear_hook_buffer':
+                hook_state['collected_states'].clear()
+                result_queue.put({'status': 'ok'})
+
+            elif cmd['type'] == 'remove_perturbation_hook':
+                if hook_state['hook_handle'] is not None:
+                    hook_state['hook_handle'].remove()
+                    hook_state['hook_handle'] = None
+                hook_state['generator'] = None
+                hook_state['collected_states'].clear()
+                result_queue.put({'status': 'ok'})
 
             elif cmd['type'] == 'run_inference':
                 prompts = cmd['inputs']
@@ -505,12 +820,17 @@ def _ep_worker_fn(rank, world_size, master_port, cmd_queue, result_queue):
                     total_chars += len(text)
                     results.append({'prompt': prompt, 'generated_text': text})
 
+                # 收集hook状态（已在CPU上）用于传回主进程
+                hook_states_for_result = list(hook_state['collected_states'])
+                hook_state['collected_states'].clear()
+
                 result_queue.put({
                     'status': 'ok',
                     'outputs': results,
                     'inference_time': t1 - t0,
                     'ep_comm_delay': ep_comm,
                     'generated_chars': total_chars,
+                    'hook_states': hook_states_for_result,
                 })
 
             elif cmd['type'] == 'reset_comm_stats':
@@ -576,6 +896,7 @@ class HFAccelerateAdapter(InferenceFrameworkInterface):
         self._ep_wrappers = []
         self._first_moe_gate = None
         self._first_moe_block = None
+        self._last_hook_states = []
         self._moe_layer_names = []
         self._cuda_timer = CUDATimer()
 
@@ -615,7 +936,7 @@ class HFAccelerateAdapter(InferenceFrameworkInterface):
         from transformers import AutoTokenizer
         trust_remote = kwargs.get('trust_remote_code', True)
         self.tokenizer = AutoTokenizer.from_pretrained(
-            model_path, trust_remote_code=trust_remote, padding_side='left'
+   #          model_path, trust_remote_code=trust_remote, padding_side='left'
         )
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -663,6 +984,54 @@ class HFAccelerateAdapter(InferenceFrameworkInterface):
             if rank == 0:
                 self._hidden_size = result['hidden_size']
                 self._num_moe_layers = result['num_moe_layers']
+
+                # 创建 _WorkerModuleProxy，支持在worker实际模块上注册hook
+                gate_info = result.get('gate_info')
+                block_info = result.get('block_info')
+
+                gate_sd = gate_info['state_dict'] if gate_info else None
+                gate_in = gate_info['in_features'] if gate_info else None
+                gate_out = gate_info['out_features'] if gate_info else None
+                gate_bias = gate_info['has_bias'] if gate_info else False
+
+                # first_moe_gate proxy -> 对应worker中 ep_wrappers[0].gate
+                self._first_moe_gate = _WorkerModuleProxy(
+                    cmd_queues=self._cmd_queues,
+                    result_queues=self._result_queues,
+                    target_name='first_moe_gate',
+                    adapter=self,
+                    gate_state_dict=gate_sd,
+                    gate_in_features=gate_in,
+                    gate_out_features=gate_out,
+                    gate_has_bias=gate_bias,
+                )
+                self.logger.info(
+                    f"Created first_moe_gate proxy"
+                    f"{f': Linear({gate_in}, {gate_out})' if gate_in else ''}"
+                )
+
+                # first_moe_block proxy -> 对应worker中 ep_wrappers[0]
+                num_exp = block_info['num_experts'] if block_info else None
+                top_k = block_info['top_k'] if block_info else None
+                norm_tp = block_info['norm_topk_prob'] if block_info else None
+
+                self._first_moe_block = _WorkerModuleProxy(
+                    cmd_queues=self._cmd_queues,
+                    result_queues=self._result_queues,
+                    target_name='first_moe_block',
+                    adapter=self,
+                    gate_state_dict=gate_sd,
+                    gate_in_features=gate_in,
+                    gate_out_features=gate_out,
+                    gate_has_bias=gate_bias,
+                    num_experts=num_exp,
+                    top_k=top_k,
+                    norm_topk_prob=norm_tp,
+                )
+                self.logger.info(
+                    f"Created first_moe_block proxy"
+                    f"{f': num_experts={num_exp}, top_k={top_k}' if num_exp else ''}"
+                )
 
         self._is_loaded = True
 
@@ -718,10 +1087,10 @@ class HFAccelerateAdapter(InferenceFrameworkInterface):
                 chunks.append([prompts[0]])
                 dummy_ranks.add(rank)
 
-        self.logger.info(
-            f"DP split: {n} prompts -> {[len(c) for c in chunks]} "
-            f"(dummy_ranks={dummy_ranks if dummy_ranks else 'none'})"
-        )
+        # self.logger.info(
+        #     f"DP split: {n} prompts -> {[len(c) for c in chunks]} "
+        #     f"(dummy_ranks={dummy_ranks if dummy_ranks else 'none'})"
+        # )
 
         # 发送推理命令（每个worker获得不同的数据子集）
         for rank in range(self._ep_size):
@@ -733,6 +1102,7 @@ class HFAccelerateAdapter(InferenceFrameworkInterface):
 
         # 从所有worker收集结果并按顺序合并
         all_outputs = []
+        self._last_hook_states = []
         max_time = 0.0
         max_ep_comm = 0.0
         total_chars = 0
@@ -746,10 +1116,14 @@ class HFAccelerateAdapter(InferenceFrameworkInterface):
                 total_chars += result.get('generated_chars', 0)
             max_time = max(max_time, result.get('inference_time', 0.0))
             max_ep_comm = max(max_ep_comm, result.get('ep_comm_delay', 0.0))
+            # 收集worker中hook收集的状态
+            hook_states = result.get('hook_states', [])
+            if rank not in dummy_ranks:
+                self._last_hook_states.extend(hook_states)
 
         self._last_outputs = all_outputs
         self._last_output = self._last_outputs[0] if self._last_outputs else None
-        self._last_comm_delay = max_time
+        self._last_comm_delay#  = max_time
         self._last_ep_comm_delay = max_ep_comm
         self._last_generated_chars = total_chars
 
@@ -846,6 +1220,22 @@ class HFAccelerateAdapter(InferenceFrameworkInterface):
     def get_underlying_model(self) -> Optional[nn.Module]:
         """模型在worker进程中，主进程无法直接访问"""
         return None
+
+    def sync_perturbation_weights(self, generator: nn.Module):
+        """
+        将主进程中更新后的扰动生成器权重同步到所有worker进程。
+        在PPO更新actor后调用此方法。
+        """
+        if not self._is_loaded:
+            return
+        cpu_sd = {k: v.cpu().clone() for k, v in generator.state_dict().items()}
+        for rank in range(self._ep_size):
+            self._cmd_queues[rank].put({
+                'type': 'sync_perturbation_weights',
+                'state_dict': cpu_sd,
+            })
+        for rank in range(self._ep_size):
+            self._result_queues[rank].get(timeout=30)
 
     def cleanup(self):
         """关闭所有worker进程"""

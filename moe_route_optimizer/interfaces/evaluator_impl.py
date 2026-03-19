@@ -92,7 +92,7 @@ class BaseEvaluator(AccuracyEvaluatorInterface):
             from datasets import load_from_disk, Dataset, DatasetDict
             import pyarrow as pa
             
-            # 如果没找到 arrow 文件，尝试直接加载目录
+            # 直接加载目录
             dataset = load_from_disk(self.dataset_path)
             
             # 处理 DatasetDict（包含多个 split 的数据集）

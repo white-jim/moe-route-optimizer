@@ -69,8 +69,8 @@ class PerturbationConfig:
     # 每次扰动的token数量 (超参数K)
     num_perturb_tokens: int = 50
     
-    # 扰动类型数量 (固定为3: -1, 0, +1)
-    num_perturb_types: int = 3
+    # 扰动维度数量
+    num_perturb_dims: int = 50
     
     # 扰动缩放因子
     perturbation_scale: float = 1.0
@@ -79,7 +79,7 @@ class PerturbationConfig:
     selector_hidden_dim: int = 64
     
     # 扰动类型决策器隐藏层维度 (减小以加速计算)
-    type_decider_hidden_dim: int = 32
+    dim_selector_hidden_dim: int = 32
 
 
 @dataclass

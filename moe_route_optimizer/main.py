@@ -555,7 +555,7 @@ def train(config: Config,
                     done=is_done,
                     log_prob=state.log_prob,
                     selected_indices=state.selected_indices,
-                    perturb_types=state.perturb_types,
+                    perturb_dim_indices=state.perturb_dim_indices,
                 )
                 
                 # 立即执行PPO或REINFORCE更新（每个batch更新一次）
@@ -564,6 +564,9 @@ def train(config: Config,
                     update_stats = ppo_trainer.update_ppo()
                 else:
                     update_stats = ppo_trainer.update()
+                
+                # 同步更新后的generator权重到worker进程
+                hook_manager.sync_weights()
                 
                 # 记录step日志
                 train_metrics_logger.log_step(
@@ -678,9 +681,9 @@ def main():
     """主函数"""
     parser = argparse.ArgumentParser(description="MoE Route Optimizer Training")
     parser.add_argument('--config', type=str, default=None, help='Configuration file path')
-    parser.add_argument('--model-path', type=str, required=True, help='Base model path')
+    parser.add_argument('--model-path', type=str, required=True, default='../../models/Qwen1.5-MoE-A2.7B')
     parser.add_argument('--dataset', type=str, default='boolq', choices=['boolq', 'hellaswag', 'dummy'])
-    parser.add_argument('--dataset-path', type=str, default='../datasets/datasets/boolq/default/0.0.0/35b264d03638db9f4ce671b711558bf7ff0f80d5', help='Dataset file path')
+    parser.add_argument('--dataset-path', type=str, default='../../datasets/boolq')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--debug', action='store_true', help='Enable debug mode')
     # 数据集大小控制参数（用于调试）
@@ -690,7 +693,7 @@ def main():
     # 框架并行配置参数（传递给推理框架，框架内部自行处理分布式）
     parser.add_argument('--tp-size', type=int, default=1, help='Tensor parallel size (framework internal)')
     parser.add_argument('--dp-size', type=int, default=2, help='Data parallel size (framework internal)')
-    parser.add_argument('--enable-ep', default=True, help='Enable expert parallel (framework internal)')
+    parser.add_argument('--ep_size', type=int, default=2)
     
     args = parser.parse_args()
     
@@ -716,35 +719,23 @@ def main():
     logger = get_train_logger()
     logger.info(f"Configuration: {config}")
     if args.max_samples is None:
-        args.max_samples = 600
+        args.max_samples = 120
     logger.info(f"Dataset size limit: {args.max_samples} samples (for debugging)")
     
     # 设置随机种子（注意：CUDA种子需要在vLLM加载后设置）
     set_seed(config.training.seed, set_cuda=False)
     
     # 创建推理框架适配器
-    framework = create_vllm_adapter()
-    framework.load_model(
-        config.model.base_model_path,
-        tensor_parallel_size=args.tp_size,
-        data_parallel_size=args.dp_size,
-        enable_expert_parallel=args.enable_ep,
-        trust_remote_code=True,
+    framework = create_hf_accelerate_adapter(
+        model_path=args.model_path,
+        ep_size=args.ep_size,
     )
-    # framework = create_hf_accelerate_adapter()
-    # framework.load_model(
-    #     config.model.base_model_path,
-    #     data_parallel_size=2,
-    #     expert_parallel_size=2,
-    # )
     
-    # vLLM加载完成后，设置CUDA种子
+    # 加载完成后，设置CUDA种子
     set_seed(config.training.seed, set_cuda=True)
     
     # 创建评估器
-    # dataset_path = args.dataset_path or os.path.join(config.path.dataset_dir, f"{args.dataset}.jsonl")
-    dataset_path = "../datasets/datasets/boolq"
-    evaluator = create_evaluator(args.dataset, dataset_path)
+    evaluator = create_evaluator(args.dataset, args.dataset_path)
     
     # 开始训练（传入max_samples参数）
     train(config, framework, evaluator, max_samples=args.max_samples)

@@ -13,4 +13,5 @@ cd ../moe_route_optimizer
 
 # export CUDA_VISIBLE_DEVICES=1
 
-torchrun --nproc-per-node=2 main.py --model-path ../models/Qwen1.5-MoE-A2.7B
+# torchrun --nproc-per-node=2 main.py --model-path ../models/Qwen1.5-MoE-A2.7B
+python main.py --model-path ../../models/Qwen1.5-MoE-A2.7B

@@ -1,6 +1,6 @@
 from .perturbation_generator import (
     TokenSelector,
-    PerturbationTypeDecider,
+    PerturbationDimSelector,
     PerturbationGenerator,
     create_perturbation_generator,
 )
@@ -14,7 +14,7 @@ from .value_network import (
 
 __all__ = [
     'TokenSelector',
-    'PerturbationTypeDecider',
+    'PerturbationDimSelector',
     'PerturbationGenerator',
     'create_perturbation_generator',
     'ValueNetwork',

@@ -9,6 +9,8 @@ numpy>=1.24.0
 
 # Hugging Face ecosystem (required by hf_accelerate_adapter)
 transformers>=4.40.0
+huggingface_hub>=0.23.0
+datasets>=2.19.0
 
 # Distributed training support (optional, used by hf_accelerate_adapter)
 accelerate>=0.30.0

@@ -24,7 +24,7 @@ class CollectedState:
     """收集的单次状态信息"""
     hidden_states: torch.Tensor  # 原始hidden states
     selected_indices: torch.Tensor  # 选中的token索引
-    perturb_types: torch.Tensor  # 扰动类型
+    perturb_dim_indices: torch.Tensor  # 每个选中token被置0的维度索引
     log_prob: torch.Tensor  # 动作对数概率
     perturbation: torch.Tensor  # 应用的扰动
 
@@ -73,7 +73,7 @@ class StateBuffer:
             grouped_data[seq_len] = {
                 'hidden_states': torch.stack([s.hidden_states for s in states_group]),
                 'selected_indices': torch.stack([s.selected_indices for s in states_group]),
-                'perturb_types': torch.stack([s.perturb_types for s in states_group]),
+                'perturb_dim_indices': torch.stack([s.perturb_dim_indices for s in states_group]),
                 'log_probs': torch.stack([s.log_prob for s in states_group]),
                 'perturbations': torch.stack([s.perturbation for s in states_group]),
                 'count': len(states_group),
@@ -97,7 +97,7 @@ class StateBuffer:
             {
                 'hidden_states': s.hidden_states,
                 'selected_indices': s.selected_indices,
-                'perturb_types': s.perturb_types,
+                'perturb_dim_indices': s.perturb_dim_indices,
                 'log_prob': s.log_prob,
                 'perturbation': s.perturbation,
             }
@@ -135,6 +135,10 @@ class HookManager:
         
         # 用于存储当前batch的信息
         self._current_batch_info: Dict[str, Any] = {}
+        
+        # 跨进程模式（用于 EP adapter 的 _WorkerModuleProxy）
+        self._cross_process_mode = False
+        self._cross_process_proxy = None
     
     @property
     def is_training(self) -> bool:
@@ -147,6 +151,8 @@ class HookManager:
             self.generator.train()
         else:
             self.generator.eval()
+        if self._cross_process_mode and self._cross_process_proxy is not None:
+            self._cross_process_proxy._set_hook_training(value)
     
     @property
     def is_enabled(self) -> bool:
@@ -155,15 +161,32 @@ class HookManager:
     @is_enabled.setter
     def is_enabled(self, value: bool):
         self._is_enabled = value
+        if self._cross_process_mode and self._cross_process_proxy is not None:
+            self._cross_process_proxy._set_hook_enabled(value)
     
     def register_hook(self, target_module: nn.Module, module_name: str = "moe_block"):
         """
         注册forward pre hook到目标模块
         
+        如果target_module是跨进程代理（_WorkerModuleProxy），
+        则自动切换到跨进程模式：将generator发送到worker进程注册。
+        
         Args:
             target_module: 目标模块（推荐使用整个MoE块，而不是只用Gate）
             module_name: 模块名称（用于日志）
         """
+        # 检测是否是跨进程代理（通过duck typing避免循环导入）
+        if hasattr(target_module, '_register_perturbation_generator'):
+            self._cross_process_mode = True
+            self._cross_process_proxy = target_module
+            target_module._register_perturbation_generator(self.generator)
+            # 同步当前状态到worker
+            target_module._set_hook_enabled(self._is_enabled)
+            target_module._set_hook_training(self._is_training)
+            self.logger.info(
+                f"Registered perturbation hook (cross-process) on module: {module_name}"
+            )
+            return
         def perturbation_hook(module, args):
             """
             Forward pre hook，在MoE块/Gate计算前修改hidden states
@@ -191,7 +214,7 @@ class HookManager:
             # 本hook只在prefill阶段执行，所以如果seq为1则直接跳过
             if hidden_states.shape[1] == 1:
                 return args
-            # print("hidden_states shape:", hidden_states.shape)
+            print("hidden_states shape:", hidden_states.shape)
             # 检查输入类型
             if not isinstance(hidden_states, torch.Tensor):
                 return args
@@ -240,14 +263,14 @@ class HookManager:
                 state = CollectedState(
                     hidden_states=hidden_states_3d.detach().clone(),
                     selected_indices=result['selected_indices'].detach().clone(),
-                    perturb_types=result['perturb_types'].detach().clone(),
+                    perturb_dim_indices=result['perturb_dim_indices'].detach().clone(),
                     log_prob=result['log_prob'].detach().clone(),
                     perturbation=perturbed_hidden_3d.detach().clone(),
                 )
                 # state = CollectedState(
                 #     hidden_states=hidden_states_3d,
                 #     selected_indices=result['selected_indices'],
-                #     perturb_types=result['perturb_types'],
+                #     perturb_dim_indices=result['perturb_dim_indices'],
                 #     log_prob=result['log_prob'],
                 #     perturbation=perturbed_hidden_3d,
                 # )
@@ -286,6 +309,10 @@ class HookManager:
     
     def remove_hooks(self):
         """移除所有注册的hook"""
+        if self._cross_process_mode and self._cross_process_proxy is not None:
+            self._cross_process_proxy._remove_perturbation_hook()
+            self._cross_process_mode = False
+            self._cross_process_proxy = None
         for handle in self._hooks:
             handle.remove()
         self._hooks.clear()
@@ -294,9 +321,48 @@ class HookManager:
     def clear_buffer(self):
         """清空状态缓冲区"""
         self.state_buffer.clear()
+        if self._cross_process_mode and self._cross_process_proxy is not None:
+            self._cross_process_proxy._clear_hook_buffer()
     
     def get_collected_data(self) -> Optional[Dict[str, torch.Tensor]]:
         """获取收集的训练数据"""
+        if self._cross_process_mode and self._cross_process_proxy is not None:
+            raw_states = self._cross_process_proxy._get_collected_states()
+            if not raw_states:
+                return None
+            # 将worker传回的原始字典转换为CollectedState格式
+            states = []
+            for s in raw_states:
+                states.append(CollectedState(
+                    hidden_states=s['hidden_states'],
+                    selected_indices=s['selected_indices'],
+                    perturb_dim_indices=s['perturb_dim_indices'],
+                    log_prob=s['log_prob'],
+                    perturbation=s['perturbation'],
+                ))
+            # 返回与StateBuffer.get_batch()相同的格式
+            from collections import defaultdict
+            grouped: Dict[int, list] = defaultdict(list)
+            seq_lengths = []
+            for state in states:
+                seq_len = state.hidden_states.shape[1]
+                grouped[seq_len].append(state)
+                seq_lengths.append(seq_len)
+            grouped_data = {}
+            for seq_len, sg in grouped.items():
+                grouped_data[seq_len] = {
+                    'hidden_states': torch.stack([s.hidden_states for s in sg]),
+                    'selected_indices': torch.stack([s.selected_indices for s in sg]),
+                    'perturb_dim_indices': torch.stack([s.perturb_dim_indices for s in sg]),
+                    'log_probs': torch.stack([s.log_prob for s in sg]),
+                    'perturbations': torch.stack([s.perturbation for s in sg]),
+                    'count': len(sg),
+                }
+            return {
+                'grouped_data': grouped_data,
+                'all_states': states,
+                'seq_lengths': seq_lengths,
+            }
         return self.state_buffer.get_batch()
     
     def set_training_mode(self, training: bool = True):
@@ -318,6 +384,17 @@ class HookManager:
     def __exit__(self, exc_type, exc_val, exc_tb):
         """上下文管理器退出，清理hook"""
         self.remove_hooks()
+
+    def sync_weights(self):
+        """
+        同步扰动生成器权重到worker进程。
+        在PPO更新actor后调用此方法，使worker中的generator副本与主进程保持一致。
+        在非跨进程模式下为no-op（因为hook直接引用同一个generator对象）。
+        """
+        if self._cross_process_mode and self._cross_process_proxy is not None:
+            self._cross_process_proxy._sync_perturbation_weights(
+                self.generator.state_dict()
+            )
 
 
 class HookManagerForMoE(HookManager):

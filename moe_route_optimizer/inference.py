@@ -219,8 +219,9 @@ def main():
     args = parser.parse_args()
     
     # 初始化日志
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     LoggerManager.setup(
-        log_dir="/mnt/data/lwy/vLLM-wrok/moe_route_optimizer/logs",
+        log_dir=os.path.join(repo_root, "logs"),
         debug=False
     )
     

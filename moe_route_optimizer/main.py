@@ -23,6 +23,7 @@ from typing import Optional, List, Tuple
 _PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
+_REPO_ROOT = os.path.dirname(_PROJECT_ROOT)
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 
 # from vllm.distributed.device_communicators.all2all import _total_all2all_time
@@ -681,9 +682,17 @@ def main():
     """主函数"""
     parser = argparse.ArgumentParser(description="MoE Route Optimizer Training")
     parser.add_argument('--config', type=str, default=None, help='Configuration file path')
-    parser.add_argument('--model-path', type=str, required=True, default='../../models/Qwen1.5-MoE-A2.7B')
+    parser.add_argument(
+        '--model-path',
+        type=str,
+        default=os.path.join(_REPO_ROOT, 'models', 'Qwen1.5-MoE-A2.7B')
+    )
     parser.add_argument('--dataset', type=str, default='boolq', choices=['boolq', 'hellaswag', 'dummy'])
-    parser.add_argument('--dataset-path', type=str, default='../../datasets/boolq')
+    parser.add_argument(
+        '--dataset-path',
+        type=str,
+        default=os.path.join(_REPO_ROOT, 'datasets', 'datasets', 'boolq')
+    )
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--debug', action='store_true', help='Enable debug mode')
     # 数据集大小控制参数（用于调试）

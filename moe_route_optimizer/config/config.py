@@ -13,7 +13,7 @@ from pathlib import Path
 class PathConfig:
     """路径配置"""
     # 项目根目录
-    project_root: str = "/mnt/data/lwy/vLLM-wrok/moe_route_optimizer"
+    project_root: str = "/mnt/data/lwy/moe-route-optimizer"
     
     # 日志目录
     log_dir: str = field(default="")

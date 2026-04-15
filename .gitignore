@@ -34,3 +34,7 @@ Thumbs.db
 *.tmp
 *.bak
 *~
+
+# Models and checkpoints
+models/
+checkpoints/

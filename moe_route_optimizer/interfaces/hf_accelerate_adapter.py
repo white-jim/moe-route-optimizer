@@ -936,7 +936,9 @@ class HFAccelerateAdapter(InferenceFrameworkInterface):
         from transformers import AutoTokenizer
         trust_remote = kwargs.get('trust_remote_code', True)
         self.tokenizer = AutoTokenizer.from_pretrained(
-   #          model_path, trust_remote_code=trust_remote, padding_side='left'
+            model_path,
+            trust_remote_code=trust_remote,
+            padding_side='left',
         )
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token

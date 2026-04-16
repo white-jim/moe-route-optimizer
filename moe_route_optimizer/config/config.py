@@ -89,11 +89,14 @@ class PPOConfig:
     use_ppo: bool = True
     
     # 学习率
-    actor_lr: float = 3e-4
+    # actor_lr: float = 3e-4
+    # 先降一点
+    actor_lr: float = 1e-4
     critic_lr: float = 1e-4
     
     # PPO裁剪参数
-    clip_epsilon: float = 0.2
+    # clip_epsilon: float = 0.2
+    clip_epsilon: float = 0.1
     
     # GAE参数
     gamma: float = 0.99
@@ -103,10 +106,11 @@ class PPOConfig:
     batch_size: int = 32
     
     # 推理时每个mini-batch的样本数
-    mini_batch_size: int = 20
+    mini_batch_size: int = 4
     
     # 每次更新的epoch数
-    ppo_epochs: int = 4
+    # ppo_epochs: int = 4
+    ppo_epochs: int = 2
     
     # 熵正则化系数
     entropy_coef: float = 0.01
@@ -125,16 +129,19 @@ class PPOConfig:
 class RewardConfig:
     """奖励计算配置"""
     # 时延奖励权重
-    latency_weight: float = 0.4
+    # latency_weight: float = 0.4
+    latency_weight: float = 0.3
     
     # 精度奖励权重
-    accuracy_weight: float = 0.6
+    # accuracy_weight: float = 0.6
+    accuracy_weight: float = 0.7
     
     # 精度惩罚阈值 (低于此值时额外惩罚)
     accuracy_penalty_threshold: float = 0.9
     
     # 精度惩罚系数
-    accuracy_penalty_coef: float = 2.0
+    # accuracy_penalty_coef: float = 2.0
+    accuracy_penalty_coef: float = 3.0
 
 
 @dataclass

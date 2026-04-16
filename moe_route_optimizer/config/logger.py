@@ -61,6 +61,7 @@ class LoggerManager:
     _loggers = {}
     _rank = 0
     _is_main = True
+    _session_log_dir = None
     
     def __new__(cls):
         if cls._instance is None:
@@ -84,10 +85,17 @@ class LoggerManager:
         # 获取rank
         cls._rank = rank if rank is not None else get_rank()
         cls._is_main = (cls._rank == 0)
+
+        # 每次启动创建独立的时间目录，避免不同运行覆盖彼此日志
+        if cls._is_main and cls._session_log_dir is None:
+            session_name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            cls._session_log_dir = os.path.join(log_dir, session_name)
+        elif cls._session_log_dir is None:
+            cls._session_log_dir = log_dir
         
         # 只有rank 0创建日志目录和文件
         if cls._is_main:
-            os.makedirs(log_dir, exist_ok=True)
+            os.makedirs(cls._session_log_dir, exist_ok=True)
         
         # 日志格式（包含rank信息）
         log_format = logging.Formatter(
@@ -109,7 +117,7 @@ class LoggerManager:
         if cls._is_main:
             # 文件handler（只有rank 0写文件）
             train_file_handler = logging.FileHandler(
-                os.path.join(log_dir, train_log_file), 
+                os.path.join(cls._session_log_dir, train_log_file), 
                 encoding='utf-8'
             )
             train_file_handler.setFormatter(log_format)
@@ -130,7 +138,7 @@ class LoggerManager:
         
         if cls._is_main:
             eval_file_handler = logging.FileHandler(
-                os.path.join(log_dir, eval_log_file),
+                os.path.join(cls._session_log_dir, eval_log_file),
                 encoding='utf-8'
             )
             eval_file_handler.setFormatter(log_format)
@@ -147,7 +155,7 @@ class LoggerManager:
         
         if cls._is_main:
             general_file_handler = logging.FileHandler(
-                os.path.join(log_dir, "general.log"),
+                os.path.join(cls._session_log_dir, "general.log"),
                 encoding='utf-8'
             )
             general_file_handler.setFormatter(log_format)
@@ -157,7 +165,9 @@ class LoggerManager:
         cls._loggers['general'] = general_logger
         
         if cls._is_main:
-            general_logger.info(f"Logger initialized. Log directory: {log_dir}, Rank: {cls._rank}")
+            general_logger.info(
+                f"Logger initialized. Log directory: {cls._session_log_dir}, Rank: {cls._rank}"
+            )
     
     @classmethod
     def get_rank(cls) -> int:

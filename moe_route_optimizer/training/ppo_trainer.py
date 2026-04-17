@@ -8,7 +8,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
-from torch.optim import Adam
+# from torch.optim import 
+from torch.optim import AdamW
 from typing import Dict, List, Optional, Tuple
 import os
 
@@ -51,13 +52,13 @@ class PolicyGradientTrainer:
         self.logger = get_train_logger()
         
         # Actor优化器
-        self.actor_optimizer = Adam(actor.parameters(), lr=config.actor_lr)
+        self.actor_optimizer = AdamW(actor.parameters(), lr=config.actor_lr)
         
         # Critic（价值网络）及其优化器
         self.value_network = value_network
         self.critic_optimizer = None
         if value_network is not None:
-            self.critic_optimizer = Adam(value_network.parameters(), lr=config.critic_lr)
+            self.critic_optimizer = AdamW(value_network.parameters(), lr=config.critic_lr)
             self.logger.info(f"PPO mode enabled: value_network params={sum(p.numel() for p in value_network.parameters())}")
         
         # 经验缓冲区（简化版）

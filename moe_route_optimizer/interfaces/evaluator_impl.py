@@ -4,7 +4,8 @@
 主要功能:
 1. BoolQEvaluator: BoolQ 数据集评估器
 2. HellaSwagEvaluator: HellaSwag 数据集评估器
-3. DummyEvaluator: 虚拟评估器（用于测试）
+3. MMLUEvaluator: MMLU 数据集评估器
+4. DummyEvaluator: 虚拟评估器（用于测试）
 """
 
 from typing import Any, Dict, List, Optional, Iterator, Tuple
@@ -471,6 +472,125 @@ class HellaSwagEvaluator(BaseEvaluator):
         return sum(scores) / len(scores)
 
 
+class MMLUEvaluator(BaseEvaluator):
+    """
+    MMLU 数据集评估器（简单实现）
+    MMLU 是一个四选一多项选择题数据集。
+    """
+
+    CHOICE_LABELS = ["A", "B", "C", "D"]
+
+    def __init__(self, dataset_path: str, split: str = "validation"):
+        super().__init__(dataset_path, split)
+        self._dataset_name = "MMLU"
+
+    def get_dataset_name(self) -> str:
+        return self._dataset_name
+
+    def _build_prompt(self, doc: Dict) -> str:
+        question = doc.get("question", "")
+        subject = doc.get("subject", "")
+        choices = doc.get("choices", [])
+
+        options_text = "\n".join(
+            f"{label}. {choice}"
+            for label, choice in zip(self.CHOICE_LABELS, choices)
+        )
+        subject_prefix = f"Subject: {subject}\n\n" if subject else ""
+
+        return (
+            f"{subject_prefix}"
+            f"Answer the following multiple-choice question by replying with only "
+            f"one letter: A, B, C, or D.\n\n"
+            f"Question: {question}\n\n"
+            f"Options:\n{options_text}\n\n"
+            f"Answer:"
+        )
+
+    def get_dataset_iterator(self, batch_size: Optional[int] = None) -> Iterator[Tuple[str, Any]]:
+        self._load_data()
+
+        if not self._data:
+            return
+
+        yielded_count = 0
+        total_samples = len(self._data)
+
+        while self._current_index < total_samples:
+            item = self._data[self._current_index]
+            self._current_index += 1
+            yielded_count += 1
+
+            answer = item.get("answer", item.get("label", 0))
+            input_text = self._build_prompt(item)
+
+            yield input_text, answer
+
+            if batch_size is not None and yielded_count >= batch_size:
+                return
+
+        if self._current_index >= total_samples:
+            self._current_index = 0
+
+    def _normalize_ground_truth(self, ground_truth: Any) -> Optional[int]:
+        if isinstance(ground_truth, int):
+            return ground_truth
+
+        if isinstance(ground_truth, str):
+            gt = ground_truth.strip().upper()
+            if gt in self.CHOICE_LABELS:
+                return self.CHOICE_LABELS.index(gt)
+            if gt.isdigit():
+                return int(gt)
+
+        if hasattr(ground_truth, "item"):
+            try:
+                return int(ground_truth.item())
+            except Exception:
+                return None
+
+        try:
+            return int(ground_truth)
+        except Exception:
+            return None
+
+    def _extract_prediction(self, model_output: Any) -> Optional[int]:
+        if model_output is None:
+            return None
+
+        output_text = str(model_output).strip().upper()
+
+        letter_match = re.search(r"\b([ABCD])\b", output_text)
+        if letter_match:
+            return self.CHOICE_LABELS.index(letter_match.group(1))
+
+        digit_match = re.search(r"\b([0-3])\b", output_text)
+        if digit_match:
+            return int(digit_match.group(1))
+
+        return None
+
+    def evaluate_single(self, model_output: Any, ground_truth: Any) -> float:
+        predicted = self._extract_prediction(model_output)
+        expected = self._normalize_ground_truth(ground_truth)
+
+        if predicted is None or expected is None:
+            return 0.0
+
+        return 1.0 if predicted == expected else 0.0
+
+    def evaluate_batch(self, model_outputs: List[Any],
+                       ground_truths: List[Any]) -> float:
+        if not model_outputs or not ground_truths:
+            return 0.0
+
+        scores = [
+            self.evaluate_single(output, truth)
+            for output, truth in zip(model_outputs, ground_truths)
+        ]
+        return sum(scores) / len(scores)
+
+
 class DummyEvaluator(AccuracyEvaluatorInterface):
     """
     虚拟评估器
@@ -518,7 +638,7 @@ def create_evaluator(
     创建评估器的工厂函数
     
     Args:
-        dataset_name: 数据集名称 ("boolq", "hellaswag", "dummy")
+        dataset_name: 数据集名称 ("boolq", "hellaswag", "mmlu", "dummy")
         dataset_path: 数据集文件路径或 HuggingFace datasets 缓存目录
         split: 数据集划分 (train/validation/test)
         **kwargs: 传递给评估器的额外参数
@@ -532,7 +652,9 @@ def create_evaluator(
         return BoolQEvaluator(dataset_path, split=split)
     elif dataset_name_lower == "hellaswag":
         return HellaSwagEvaluator(dataset_path, split=split)
+    elif dataset_name_lower == "mmlu":
+        return MMLUEvaluator(dataset_path, split=split)
     elif dataset_name_lower == "dummy":
         return DummyEvaluator()
     else:
-        raise ValueError(f"Unknown dataset: {dataset_name}. Supported: boolq, hellaswag, dummy.")
+        raise ValueError(f"Unknown dataset: {dataset_name}. Supported: boolq, hellaswag, mmlu, dummy.")

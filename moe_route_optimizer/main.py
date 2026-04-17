@@ -685,9 +685,9 @@ def main():
     parser.add_argument(
         '--model-path',
         type=str,
-        default=os.path.join(_REPO_ROOT, 'models', 'Ministral-3-8B')
+        default=os.path.join(_REPO_ROOT, 'models', 'Qwen1.5-MoE-A2.7B')
     )
-    parser.add_argument('--dataset', type=str, default='boolq', choices=['boolq', 'hellaswag', 'dummy'])
+    parser.add_argument('--dataset', type=str, default='boolq', choices=['boolq', 'hellaswag', 'mmlu', 'dummy'])
     parser.add_argument(
         '--dataset-path',
         type=str,

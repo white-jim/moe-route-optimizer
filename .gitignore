@@ -38,3 +38,4 @@ Thumbs.db
 # Models and checkpoints
 models/
 checkpoints/
+datasets.zip

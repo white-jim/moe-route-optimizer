@@ -1125,7 +1125,7 @@ class HFAccelerateAdapter(InferenceFrameworkInterface):
 
         self._last_outputs = all_outputs
         self._last_output = self._last_outputs[0] if self._last_outputs else None
-        self._last_comm_delay = max_time
+        self._last_comm_delay#  = max_time
         self._last_ep_comm_delay = max_ep_comm
         self._last_generated_chars = total_chars
 
@@ -1159,10 +1159,7 @@ class HFAccelerateAdapter(InferenceFrameworkInterface):
                 for o in self._last_outputs]
 
     def get_comm_delay(self) -> float:
-        # return self._last_comm_delay
-        # 训练主链路改为使用 EP all-to-all 通信时延（dispatch + combine），
-        # 而不是端到端推理耗时。
-        return self._last_ep_comm_delay
+        return self._last_comm_delay
 
     def get_ep_comm_delay(self) -> float:
         """获取EP all-to-all通信时延"""
@@ -1170,10 +1167,8 @@ class HFAccelerateAdapter(InferenceFrameworkInterface):
 
     def get_comm_delay_per_token(self) -> float:
         if self._last_generated_chars > 0:
-            # return self._last_comm_delay / self._last_generated_chars
-            return self._last_ep_comm_delay / self._last_generated_chars
-        # return self._last_comm_delay
-        return self._last_ep_comm_delay
+            return self._last_comm_delay / self._last_generated_chars
+        return self._last_comm_delay
 
     def get_comm_delay_per_layer(self) -> Dict[int, float]:
         return {}

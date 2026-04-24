@@ -21,6 +21,7 @@ import socket
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from typing import Any, Dict, List, Optional, Union
@@ -48,10 +49,16 @@ def _find_free_port():
 def _get_num_experts_from_config(config) -> int:
     return (
         getattr(config, 'num_experts', None)
+        or getattr(config, 'moe_num_experts', None)
         or getattr(config, 'num_local_experts', None)
         or getattr(config, 'n_routed_experts', None)
         or 8
     )
+
+
+def _supports_generic_ep_wrapper(config) -> bool:
+    model_type = getattr(config, 'model_type', None)
+    return model_type not in {'deepseek_v2', 'jetmoe'}
 
 
 def _should_use_native_ep(config, world_size: int) -> bool:
@@ -62,14 +69,28 @@ def _should_use_native_ep(config, world_size: int) -> bool:
     return getattr(config, 'model_type', None) in {'deepseek_v2'}
 
 
+def _should_use_jetmoe_native_ep(config, world_size: int) -> bool:
+    if world_size <= 1:
+        return False
+    return getattr(config, 'model_type', None) == 'jetmoe'
+
+
 def _extract_gate_info(gate) -> Optional[Dict[str, Any]]:
     if gate is None:
         return None
 
-    state_dict = gate.state_dict()
+    gate_for_meta = gate
+    if (
+        not hasattr(gate_for_meta, 'in_features')
+        and hasattr(gate_for_meta, 'layer')
+        and isinstance(gate_for_meta.layer, nn.Linear)
+    ):
+        gate_for_meta = gate_for_meta.layer
+
+    state_dict = gate_for_meta.state_dict()
     weight = state_dict.get('weight')
-    in_features = getattr(gate, 'in_features', None)
-    out_features = getattr(gate, 'out_features', None)
+    in_features = getattr(gate_for_meta, 'in_features', None)
+    out_features = getattr(gate_for_meta, 'out_features', None)
 
     if weight is not None:
         if out_features is None:
@@ -95,6 +116,8 @@ def _extract_block_info(block, num_experts: int) -> Optional[Dict[str, Any]]:
         top_k = block.num_experts_per_tok
     if top_k is None and gate is not None:
         top_k = getattr(gate, 'top_k', None)
+    if top_k is None and hasattr(block, 'config'):
+        top_k = getattr(block.config, 'moe_top_k', None)
 
     norm_topk_prob = getattr(block, 'norm_topk_prob', None)
     if norm_topk_prob is None and gate is not None:
@@ -372,6 +395,199 @@ class ExpertParallelWrapper(nn.Module):
             # )
 
         return output_flat.view(batch_size, seq_len, hidden_size)
+
+
+class JetMoeNativeEPWrapper(nn.Module):
+    """
+    JetMoE MLP 专用 EP 包装器。
+
+    JetMoE 的 MLP 专家参数存放在两组并行专家权重中：
+    - input_linear.weight: [num_experts, hidden*2, input]
+    - output_linear.weight: [num_experts, input, hidden]
+
+    这里按照 expert 维度做物理切分，并通过 all-to-all 分发 token 到目标 rank，
+    从而避免对 JetMoE 误用通用 ModuleList-experts wrapper。
+    """
+
+    def __init__(self, original_moe_layer, world_size=2, rank=0,
+                 num_experts=8, layer_idx=0, logger=None):
+        super().__init__()
+        self.world_size = world_size
+        self.rank = rank
+        self.num_experts = num_experts
+        self.experts_per_gpu = num_experts // world_size
+        self.layer_idx = layer_idx
+        self.logger = logger
+
+        self.expert_start = rank * self.experts_per_gpu
+        self.expert_end = self.expert_start + self.experts_per_gpu
+
+        self.gate = original_moe_layer.router
+        self.input_size = original_moe_layer.input_size
+        self.hidden_size = original_moe_layer.hidden_size
+        self.top_k = getattr(self.gate, 'top_k', 2)
+        self.activation = original_moe_layer.activation
+        self.bias = original_moe_layer.bias
+
+        self.input_linear_weight = nn.Parameter(
+            original_moe_layer.input_linear.weight[self.expert_start:self.expert_end].contiguous()
+        )
+        self.output_linear_weight = nn.Parameter(
+            original_moe_layer.output_linear.weight[self.expert_start:self.expert_end].contiguous()
+        )
+
+        self._total_comm_delay = 0.0
+        self._forward_count = 0
+
+    def _log(self, msg):
+        if self.logger:
+            self.logger.info(msg)
+
+    def reset_comm_delay(self):
+        self._total_comm_delay = 0.0
+        self._forward_count = 0
+
+    def get_comm_delay(self):
+        return self._total_comm_delay
+
+    def _run_local_expert(self, hidden_states, local_expert_idx):
+        hidden_states = F.linear(hidden_states, self.input_linear_weight[local_expert_idx])
+        left, right = hidden_states.chunk(2, dim=-1)
+        hidden_states = self.activation(left) * right
+        hidden_states = F.linear(hidden_states, self.output_linear_weight[local_expert_idx])
+        return hidden_states
+
+    def forward(self, layer_input, *args, **kwargs):
+        self._forward_count += 1
+
+        if not dist.is_initialized() or self.world_size <= 1:
+            raise RuntimeError("JetMoE native EP requires distributed env with world_size > 1")
+
+        batch_size, seq_len, emb_size = layer_input.size()
+        flat_input = layer_input.reshape(-1, emb_size)
+        device = flat_input.device
+        dtype = flat_input.dtype
+
+        _, batch_index, batch_gates, expert_size, router_logits = self.gate(flat_input)
+        if isinstance(expert_size, torch.Tensor):
+            expert_size = expert_size.tolist()
+
+        expert_inputs = flat_input[batch_index]
+        global_eids = torch.repeat_interleave(
+            torch.arange(self.num_experts, device=device, dtype=torch.long),
+            torch.tensor(expert_size, device=device, dtype=torch.long),
+        )
+        expert_to_gpu = global_eids // self.experts_per_gpu
+
+        send_counts = [(expert_to_gpu == gpu_id).sum().item() for gpu_id in range(self.world_size)]
+        send_counts_tensor = torch.tensor(send_counts, dtype=torch.long, device=device)
+        recv_counts_tensor = torch.zeros_like(send_counts_tensor)
+
+        comm_start = torch.cuda.Event(enable_timing=True)
+        comm_mid = torch.cuda.Event(enable_timing=True)
+        comm_end = torch.cuda.Event(enable_timing=True)
+        comm_start.record()
+
+        dist.all_to_all_single(recv_counts_tensor, send_counts_tensor)
+
+        recv_counts = recv_counts_tensor.tolist()
+        total_send = sum(send_counts)
+        total_recv = sum(recv_counts)
+
+        send_hidden_list, send_gates_list = [], []
+        send_eids_list, send_tids_list = [], []
+        for gpu_id in range(self.world_size):
+            mask = expert_to_gpu == gpu_id
+            if mask.any():
+                send_hidden_list.append(expert_inputs[mask])
+                send_gates_list.append(batch_gates[mask].to(dtype))
+                send_eids_list.append(global_eids[mask] - gpu_id * self.experts_per_gpu)
+                send_tids_list.append(batch_index[mask])
+            else:
+                send_hidden_list.append(torch.empty(0, emb_size, device=device, dtype=dtype))
+                send_gates_list.append(torch.empty(0, device=device, dtype=dtype))
+                send_eids_list.append(torch.empty(0, device=device, dtype=torch.long))
+                send_tids_list.append(torch.empty(0, device=device, dtype=torch.long))
+
+        recv_hidden = torch.zeros(total_recv, emb_size, device=device, dtype=dtype)
+        recv_gates = torch.zeros(total_recv, device=device, dtype=dtype)
+        recv_eids = torch.zeros(total_recv, device=device, dtype=torch.long)
+        recv_tids = torch.zeros(total_recv, device=device, dtype=torch.long)
+
+        if total_send > 0 or total_recv > 0:
+            for send_list, recv_ref, dim, dt in [
+                (send_hidden_list, 'hidden', emb_size, dtype),
+                (send_gates_list, 'gates', None, dtype),
+                (send_eids_list, 'eids', None, torch.long),
+                (send_tids_list, 'tids', None, torch.long),
+            ]:
+                send_split = [t.clone() for t in send_list]
+                if dim is not None:
+                    recv_split = [torch.zeros(c, dim, device=device, dtype=dt) for c in recv_counts]
+                else:
+                    recv_split = [torch.zeros(c, device=device, dtype=dt) for c in recv_counts]
+                dist.all_to_all(recv_split, send_split)
+                cat = torch.cat(recv_split, dim=0) if total_recv > 0 else None
+                if recv_ref == 'hidden' and cat is not None:
+                    recv_hidden = cat
+                elif recv_ref == 'gates' and cat is not None:
+                    recv_gates = cat
+                elif recv_ref == 'eids' and cat is not None:
+                    recv_eids = cat
+                elif recv_ref == 'tids' and cat is not None:
+                    recv_tids = cat
+
+        comm_mid.record()
+
+        recv_output = torch.zeros(total_recv, self.input_size, device=device, dtype=dtype)
+        if total_recv > 0:
+            for local_idx in range(self.experts_per_gpu):
+                mask = recv_eids == local_idx
+                if mask.any():
+                    recv_output[mask] = self._run_local_expert(recv_hidden[mask], local_idx)
+        recv_output = recv_output * recv_gates.unsqueeze(-1)
+
+        send_output = torch.zeros(total_send, self.input_size, device=device, dtype=dtype)
+        send_back_tids = torch.zeros(total_send, device=device, dtype=torch.long)
+        if total_send > 0 or total_recv > 0:
+            recv_output_split, offset = [], 0
+            for c in recv_counts:
+                if c > 0:
+                    recv_output_split.append(recv_output[offset:offset + c].clone())
+                    offset += c
+                else:
+                    recv_output_split.append(torch.empty(0, self.input_size, device=device, dtype=dtype))
+            send_output_split = [
+                torch.zeros(c, self.input_size, device=device, dtype=dtype) for c in send_counts
+            ]
+            dist.all_to_all(send_output_split, recv_output_split)
+            if total_send > 0:
+                send_output = torch.cat(send_output_split, dim=0)
+
+            recv_tid_split, offset = [], 0
+            for c in recv_counts:
+                if c > 0:
+                    recv_tid_split.append(recv_tids[offset:offset + c].clone())
+                    offset += c
+                else:
+                    recv_tid_split.append(torch.empty(0, device=device, dtype=torch.long))
+            send_tid_split = [torch.zeros(c, device=device, dtype=torch.long) for c in send_counts]
+            dist.all_to_all(send_tid_split, recv_tid_split)
+            if total_send > 0:
+                send_back_tids = torch.cat(send_tid_split, dim=0)
+
+        comm_end.record()
+        torch.cuda.synchronize()
+        self._total_comm_delay += (
+            comm_start.elapsed_time(comm_mid) + comm_mid.elapsed_time(comm_end)
+        ) / 1000.0
+
+        zeros = torch.zeros(batch_size * seq_len, self.input_size, device=device, dtype=dtype)
+        if total_send > 0:
+            zeros.index_add_(0, send_back_tids, send_output)
+        layer_output = zeros.view(batch_size, seq_len, self.input_size)
+        layer_output = layer_output + self.bias.to(dtype)
+        return layer_output, router_logits
 
 
 class DeepSeekNativeEPWrapper(nn.Module):
@@ -696,6 +912,21 @@ def _find_moe_layers_in_model(model, logger=None):
     """查找模型中的MoE层"""
     moe_layers, moe_names = [], []
     first_block, first_gate = None, None
+    model_type = getattr(getattr(model, 'config', None), 'model_type', None)
+
+    if model_type == 'jetmoe':
+        for name, module in model.named_modules():
+            cls = module.__class__.__name__.lower()
+            if cls == 'jetmoemoe':
+                moe_layers.append(module)
+                moe_names.append(name)
+                if first_block is None:
+                    first_block = module
+                if first_gate is None:
+                    first_gate = getattr(module, 'router', None)
+        if logger:
+            logger.info(f"Found {len(moe_layers)} JetMoE layers")
+        return moe_layers, moe_names, first_block, first_gate
 
     block_kw = ['sparsemoe', 'moeblock', 'moelayer', 'moe']
     exclude_kw = ['expert', 'fusedmoe', 'sharedfusedmoe', 'gate', 'router']
@@ -733,6 +964,26 @@ def _find_moe_layers_in_model(model, logger=None):
     if logger:
         logger.info(f"Found {len(moe_layers)} MoE layers")
     return moe_layers, moe_names, first_block, first_gate
+
+
+def _tensor_to_queue_payload(tensor: torch.Tensor) -> Dict[str, Any]:
+    """Convert a tensor into a multiprocessing.Queue-safe payload."""
+    cpu_tensor = tensor.detach().cpu().contiguous()
+    array_tensor = cpu_tensor
+    if cpu_tensor.dtype == torch.bfloat16:
+        array_tensor = cpu_tensor.to(torch.float32)
+    return {
+        'array': array_tensor.numpy(),
+        'dtype': str(cpu_tensor.dtype),
+    }
+
+
+def _serialize_hook_state_for_queue(state: Dict[str, torch.Tensor]) -> Dict[str, Any]:
+    """Convert collected hook state into payloads that do not rely on torch FD sharing."""
+    return {
+        key: _tensor_to_queue_payload(value)
+        for key, value in state.items()
+    }
 
 
 def _replace_module_in_model(model, module_name, new_module):
@@ -797,6 +1048,9 @@ def _ep_worker_fn(rank, world_size, master_port, cmd_queue, result_queue):
                 hidden_size = getattr(config, 'hidden_size', 2048)
                 num_experts = _get_num_experts_from_config(config)
                 use_native_ep = _should_use_native_ep(config, world_size)
+                use_jetmoe_native_ep = _should_use_jetmoe_native_ep(config, world_size)
+                use_generic_ep_wrapper = _supports_generic_ep_wrapper(config)
+                latency_metric = 'end_to_end'
 
                 if use_native_ep:
                     if num_experts % world_size != 0:
@@ -808,6 +1062,11 @@ def _ep_worker_fn(rank, world_size, master_port, cmd_queue, result_queue):
                     logger.info(
                         f"[Worker {rank}] Enabling native EP for model_type="
                         f"{getattr(config, 'model_type', 'unknown')} with ep_size={world_size}"
+                    )
+                if use_jetmoe_native_ep and num_experts % world_size != 0:
+                    raise RuntimeError(
+                        f"JetMoE native EP requires num_experts divisible by world_size, "
+                        f"got num_experts={num_experts}, world_size={world_size}"
                     )
 
                 tokenizer = AutoTokenizer.from_pretrained(
@@ -848,6 +1107,7 @@ def _ep_worker_fn(rank, world_size, master_port, cmd_queue, result_queue):
 
                 if world_size > 1 and moe_layers:
                     if use_native_ep:
+                        latency_metric = 'ep_comm'
                         logger.info(
                             f"[Worker {rank}] Wrapping native EP MoE layers: {len(moe_layers)} layers, "
                             f"{num_experts} experts total, local experts per rank={experts_per_gpu}"
@@ -858,7 +1118,25 @@ def _ep_worker_fn(rank, world_size, master_port, cmd_queue, result_queue):
                             )
                             ep_wrappers.append(wrapper)
                             _replace_module_in_model(model, name, wrapper)
-                    else:
+                    elif use_jetmoe_native_ep:
+                        latency_metric = 'ep_comm'
+                        logger.info(
+                            f"[Worker {rank}] Wrapping JetMoE native EP layers: {len(moe_layers)} layers, "
+                            f"{num_experts} experts total, local experts per rank={experts_per_gpu}"
+                        )
+                        for idx, (layer, name) in enumerate(zip(moe_layers, moe_names)):
+                            wrapper = JetMoeNativeEPWrapper(
+                                layer,
+                                world_size=world_size,
+                                rank=rank,
+                                num_experts=num_experts,
+                                layer_idx=idx,
+                                logger=logger,
+                            )
+                            ep_wrappers.append(wrapper)
+                            _replace_module_in_model(model, name, wrapper)
+                    elif use_generic_ep_wrapper:
+                        latency_metric = 'ep_comm'
                         logger.info(
                             f"[Worker {rank}] Applying EP on CPU: {len(moe_layers)} layers, "
                             f"{num_experts} experts total, keeping experts "
@@ -874,6 +1152,12 @@ def _ep_worker_fn(rank, world_size, master_port, cmd_queue, result_queue):
 
                         # 显式删除对原始MoE层（含全量专家）的引用，使非本地专家可被GC回收
                         logger.info(f"[Worker {rank}] Non-local experts freed from CPU memory")
+                    else:
+                        logger.info(
+                            f"[Worker {rank}] model_type={getattr(config, 'model_type', 'unknown')} "
+                            f"does not match generic EP wrapper assumptions; keeping original MoE "
+                            f"layers and using replicated DP execution"
+                        )
                     del moe_layers, moe_names
                     gc.collect()
                 else:
@@ -904,6 +1188,7 @@ def _ep_worker_fn(rank, world_size, master_port, cmd_queue, result_queue):
                     'num_moe_layers': len(ep_wrappers) if ep_wrappers else num_detected_moe_layers,
                     'gate_info': gate_info,
                     'block_info': block_info,
+                    'latency_metric': latency_metric,
                 })
 
             elif cmd['type'] == 'register_hook':
@@ -1071,7 +1356,10 @@ def _ep_worker_fn(rank, world_size, master_port, cmd_queue, result_queue):
                     results.append({'prompt': prompt, 'generated_text': text})
 
                 # 收集hook状态（已在CPU上）用于传回主进程
-                hook_states_for_result = list(hook_state['collected_states'])
+                hook_states_for_result = [
+                    _serialize_hook_state_for_queue(state)
+                    for state in hook_state['collected_states']
+                ]
                 hook_state['collected_states'].clear()
 
                 result_queue.put({
@@ -1136,6 +1424,7 @@ class HFAccelerateAdapter(InferenceFrameworkInterface):
         self._last_ep_comm_delay = 0.0
         self._last_generated_chars = 0
         self._is_loaded = False
+        self._latency_metric = 'end_to_end'
 
         # 接口兼容
         self._dp_rank = 0
@@ -1236,6 +1525,7 @@ class HFAccelerateAdapter(InferenceFrameworkInterface):
             if rank == 0:
                 self._hidden_size = result['hidden_size']
                 self._num_moe_layers = result['num_moe_layers']
+                self._latency_metric = result.get('latency_metric', 'end_to_end')
 
                 # 创建 _WorkerModuleProxy，支持在worker实际模块上注册hook
                 gate_info = result.get('gate_info')
@@ -1297,7 +1587,7 @@ class HFAccelerateAdapter(InferenceFrameworkInterface):
 
         self.logger.info(
             f"EP model ready: {ep_size} GPUs, hidden_size={self._hidden_size}, "
-            f"moe_layers={self._num_moe_layers}"
+            f"moe_layers={self._num_moe_layers}, latency_metric={self._latency_metric}"
         )
         return None
 
@@ -1409,10 +1699,9 @@ class HFAccelerateAdapter(InferenceFrameworkInterface):
                 for o in self._last_outputs]
 
     def get_comm_delay(self) -> float:
-        # return self._last_comm_delay
-        # 训练主链路改为使用 EP all-to-all 通信时延（dispatch + combine），
-        # 而不是端到端推理耗时。
-        return self._last_ep_comm_delay
+        if self._latency_metric == 'ep_comm':
+            return self._last_ep_comm_delay
+        return self._last_comm_delay
 
     def get_ep_comm_delay(self) -> float:
         """获取EP all-to-all通信时延"""
@@ -1420,10 +1709,12 @@ class HFAccelerateAdapter(InferenceFrameworkInterface):
 
     def get_comm_delay_per_token(self) -> float:
         if self._last_generated_chars > 0:
-            # return self._last_comm_delay / self._last_generated_chars
-            return self._last_ep_comm_delay / self._last_generated_chars
-        # return self._last_comm_delay
-        return self._last_ep_comm_delay
+            if self._latency_metric == 'ep_comm':
+                return self._last_ep_comm_delay / self._last_generated_chars
+            return self._last_comm_delay / self._last_generated_chars
+        if self._latency_metric == 'ep_comm':
+            return self._last_ep_comm_delay
+        return self._last_comm_delay
 
     def get_comm_delay_per_layer(self) -> Dict[int, float]:
         return {}
@@ -1517,6 +1808,7 @@ class HFAccelerateAdapter(InferenceFrameworkInterface):
         self._cmd_queues = []
         self._result_queues = []
         self._is_loaded = False
+        self._latency_metric = 'end_to_end'
         self.logger.info("All EP workers shut down")
 
 

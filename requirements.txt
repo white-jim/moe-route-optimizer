@@ -8,7 +8,8 @@ torch>=2.0.0
 numpy>=1.24.0
 
 # Hugging Face ecosystem (required by hf_accelerate_adapter)
-transformers>=4.40.0
+# transformers>=4.40.0
+transformers==4.54.1
 huggingface_hub>=0.23.0
 datasets>=2.19.0
 
